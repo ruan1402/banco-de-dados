@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: catalogo-de-apps
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 2 -b 0.0.0.0:$PORT app:app
+    healthCheckPath: /healthz
+    disk:
+      name: dados
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: DATA_DIR
+        value: /var/data
+      - key: COOKIE_SECURE
+        value: "1"
+      - key: BEHIND_PROXY
+        value: "1"
+      - key: SEED_ON_START
+        value: "1"
+      - key: ADMIN_EMAIL
+        value: domruan1402@gmail.com
+      - key: ADMIN_PASSWORD
+        sync: false
