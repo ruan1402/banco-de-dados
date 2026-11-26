@@ -1,0 +1,14 @@
+{
+  "name": "Gato Faminto",
+  "description": "Jogo de labirinto arcade original: um gato come petiscos e foge de 4 cachorros perseguidores, com peixes de poder, vidas, níveis e recorde. Feito no Claude Design.",
+  "category": "Jogo",
+  "tech": [
+    "HTML",
+    "CSS",
+    "JavaScript",
+    "Claude Design"
+  ],
+  "url": "",
+  "version": "1.0",
+  "notes": "Pasta pac-man. Artefato no Claude Design (privado): https://claude.ai/artifact/4WXgA7gHM3LG9KzgbsFNpE"
+}
