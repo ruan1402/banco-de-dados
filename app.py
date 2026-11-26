@@ -363,46 +363,37 @@ def api_me():
     return jsonify(user=user_payload(u) if u else None)
 
 
-@app.post("/api/register")
-def api_register():
+@app.post("/api/login")
+def api_login():
+    """Entrar só com e-mail. Apenas o e-mail do administrador exige senha."""
     d = read_json()
     email = str(d.get("email", "")).strip().lower()
     pw = str(d.get("password", ""))
     if not EMAIL_RE.match(email) or len(email) > 254:
         return jsonify(error="Informe um e-mail válido."), 400
-    if len(pw) < 8 or len(pw) > 200:
-        return jsonify(error="A senha precisa ter pelo menos 8 caracteres."), 400
-    if email == ADMIN_EMAIL:
-        return jsonify(error="Este e-mail é reservado ao administrador. Use 'Entrar'."), 403
-    try:
-        cur = db().execute(
-            "INSERT INTO users(email, pw_hash, created_at) VALUES (?,?,?)",
-            (email, hash_pw(pw), now()),
-        )
-        db().commit()
-    except INTEGRITY:
-        return jsonify(error="Este e-mail já está cadastrado. Use 'Entrar'."), 409
-    session.clear()
-    session["uid"] = cur.lastrowid
-    session.permanent = True
-    g.pop("me", None)
-    return jsonify(user=user_payload(me())), 201
-
-
-@app.post("/api/login")
-def api_login():
-    d = read_json()
-    email = str(d.get("email", "")).strip().lower()
-    pw = str(d.get("password", ""))
     key = (request.remote_addr, email)
     if throttled(key):
         return jsonify(error="Muitas tentativas. Aguarde alguns minutos."), 429
     u = db().execute("SELECT id, email, pw_hash FROM users WHERE email=?", (email,)).fetchone()
-    ok = check_pw(pw, u["pw_hash"] if u else DUMMY_HASH)
-    if not u or not ok:
-        FAILS.setdefault(key, []).append(time.time())
-        return jsonify(error="E-mail ou senha incorretos."), 401
-    FAILS.pop(key, None)
+    if email == ADMIN_EMAIL:
+        if not pw:
+            return jsonify(need_password=True)
+        if not u or not check_pw(pw, u["pw_hash"]):
+            FAILS.setdefault(key, []).append(time.time())
+            return jsonify(error="Senha incorreta."), 401
+        FAILS.pop(key, None)
+    elif not u:
+        # visitante: cadastro automático, somente visualização (sem senha utilizável)
+        try:
+            cur = db().execute(
+                "INSERT INTO users(email, pw_hash, created_at) VALUES (?,?,?)",
+                (email, "sem-senha$0$0", now()),
+            )
+            db().commit()
+            uid = cur.lastrowid
+        except INTEGRITY:
+            uid = db().execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()["id"]
+        u = {"id": uid}
     session.clear()
     session["uid"] = u["id"]
     session.permanent = True

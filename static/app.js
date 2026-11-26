@@ -82,14 +82,14 @@ function shell(inner) {
         </nav>
         <div class="account">
           <div class="who"><span>${esc(ME.email)}</span><small>${ME.admin ? "Administrador" : "Somente visualização"}</small></div>
-          <button class="btn ghost" id="btn-pw">Senha</button>
+          ${ME.admin ? `<button class="btn ghost" id="btn-pw">Senha</button>` : ""}
           <button class="btn ghost" id="btn-logout">Sair</button>
         </div>
       </header>
       <main class="main">${inner}</main>
     </div>`;
   $("#btn-logout").onclick = async () => { try { await api("POST", "/api/logout"); } catch { /* ignora */ } ME = null; go("#/login"); };
-  $("#btn-pw").onclick = changePasswordDialog;
+  if ($("#btn-pw")) $("#btn-pw").onclick = changePasswordDialog;
 }
 
 const head = (eyebrow, title, right = "") =>
@@ -122,9 +122,8 @@ function changePasswordDialog() {
   };
 }
 
-/* ---------- login / cadastro ---------- */
+/* ---------- login (só e-mail; o administrador também informa a senha) ---------- */
 function viewLogin() {
-  let mode = "login";
   shell(`<div class="login">
     <section class="hero">
       <span class="eyebrow">Catálogo pessoal</span>
@@ -133,38 +132,25 @@ function viewLogin() {
       <ul class="feats">
         <li><span class="cover c0">DB</span>Catálogo com banco de dados, sempre à mão.</li>
         <li><span class="cover c5">{ }</span>Código de cada app guardado em versões, com visualizador.</li>
-        <li><span class="cover c9">ADM</span>O administrador edita. Os demais cadastrados só visualizam.</li>
+        <li><span class="cover c9">ADM</span>O administrador edita. Os demais e-mails só visualizam.</li>
       </ul>
     </section>
     <section class="formside"><div class="panel aside auth">
-      <div class="seg" id="auth-tabs">
-        <button data-m="login" class="on">Entrar</button>
-        <button data-m="register">Criar conta</button>
-      </div>
-      <h2 id="au-title">Bem-vindo de volta</h2>
+      <h2>Entrar</h2>
       <form id="f-auth">
         <label for="au-e">E-mail</label><input id="au-e" type="email" autocomplete="email" placeholder="voce@exemplo.com" required>
-        <label for="au-p">Senha</label><input id="au-p" type="password" minlength="8" placeholder="Mínimo de 8 caracteres" required>
-        <div class="hint" id="au-h"></div>
+        <div id="au-pbox" hidden>
+          <label for="au-p">Senha do administrador</label><input id="au-p" type="password" autocomplete="current-password">
+        </div>
         <div class="err" id="au-err" role="alert"></div>
         <button class="btn primary big" id="au-b">Entrar</button>
       </form></div></section></div>`);
-  const apply = () => {
-    $$("#auth-tabs button").forEach((b) => b.classList.toggle("on", b.dataset.m === mode));
-    $("#au-b").textContent = mode === "login" ? "Entrar" : "Criar conta";
-    $("#au-p").autocomplete = mode === "login" ? "current-password" : "new-password";
-    $("#au-h").textContent = mode === "register"
-      ? "Contas novas podem apenas visualizar os projetos, READMEs e códigos." : "";
-    $("#au-err").textContent = "";
-    $("#au-title").textContent = mode === "login" ? "Bem-vindo de volta" : "Criar conta";
-  };
-  $("#auth-tabs").onclick = (e) => { const b = e.target.closest("button"); if (b) { mode = b.dataset.m; apply(); } };
   $("#f-auth").onsubmit = async (ev) => {
     ev.preventDefault();
-    const btn = $("#au-b"); btn.disabled = true;
+    const btn = $("#au-b"); btn.disabled = true; $("#au-err").textContent = "";
     try {
-      const r = await api("POST", mode === "login" ? "/api/login" : "/api/register",
-        { email: $("#au-e").value, password: $("#au-p").value });
+      const r = await api("POST", "/api/login", { email: $("#au-e").value, password: $("#au-p").value });
+      if (r.need_password) { $("#au-pbox").hidden = false; $("#au-p").focus(); btn.disabled = false; return; }
       ME = r.user; go("#/");
     } catch (e) { $("#au-err").textContent = e.message; btn.disabled = false; }
   };
