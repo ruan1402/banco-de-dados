@@ -890,14 +890,24 @@ def seed():
     print(f"{n} app(s) de exemplo cadastrados. Ajuste status, links e README pelo site.")
 
 
-init_db()
+def _startup():
+    init_db()
+    if os.environ.get("SEED_ON_START") == "1":
+        _c = raw_connect()
+        _n = _c.execute("SELECT COUNT(*) AS n FROM apps").fetchone()["n"]
+        _c.close()
+        if _n == 0:
+            seed()
 
-if os.environ.get("SEED_ON_START") == "1":
-    _c = raw_connect()
-    _n = _c.execute("SELECT COUNT(*) AS n FROM apps").fetchone()["n"]
-    _c.close()
-    if _n == 0:
-        seed()
+
+if DATABASE_URL:
+    _startup()  # no Postgres a corrida é evitada pelo advisory lock
+else:
+    import fcntl  # SQLite: um único worker inicializa por vez
+    DATA.mkdir(parents=True, exist_ok=True)
+    with open(DATA / ".init.lock", "w") as _lf:
+        fcntl.flock(_lf, fcntl.LOCK_EX)
+        _startup()
 
 
 @app.get("/healthz")
