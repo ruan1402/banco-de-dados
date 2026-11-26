@@ -113,6 +113,90 @@ CREATE INDEX IF NOT EXISTS idx_versions_app ON versions(app_id);
 CREATE INDEX IF NOT EXISTS idx_files_version ON files(version_id);
 """
 
+# --------------------------------------------------------------------------- banco
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
+if os.environ.get("REQUIRE_DATABASE_URL") == "1" and not DATABASE_URL:
+    raise SystemExit("DATABASE_URL não definida: sem ela os dados se perderiam a cada reinício.")
+if DATABASE_URL:
+    import psycopg
+    from psycopg.rows import dict_row
+    INTEGRITY = (sqlite3.IntegrityError, psycopg.IntegrityError)
+else:
+    INTEGRITY = (sqlite3.IntegrityError,)
+
+
+def pg_sql(sql):
+    """Traduz o SQL (escrito com ? do SQLite) para o estilo do Postgres."""
+    return sql.replace("?", "%s")
+
+
+class PGCursor:
+    def __init__(self, cur, lastrowid=None):
+        self._cur, self.lastrowid = cur, lastrowid
+
+    def fetchone(self):
+        return self._cur.fetchone()
+
+    def fetchall(self):
+        return self._cur.fetchall()
+
+    def __iter__(self):
+        return iter(self._cur)
+
+
+class PGConn:
+    """Mesma interface usada do sqlite3 (execute/executemany/commit/close), em cima do Postgres."""
+
+    def __init__(self):
+        self.c = psycopg.connect(DATABASE_URL, row_factory=dict_row, prepare_threshold=None)
+
+    def execute(self, sql, params=()):
+        q = pg_sql(sql)
+        is_insert = q.lstrip().upper().startswith("INSERT") and "RETURNING" not in q.upper()
+        if is_insert:
+            q += " RETURNING id"
+        cur = self.c.execute(q, params)
+        return PGCursor(cur, cur.fetchone()["id"] if is_insert else None)
+
+    def executemany(self, sql, seq):
+        with self.c.cursor() as cur:
+            cur.executemany(pg_sql(sql), list(seq))
+
+    def commit(self):
+        self.c.commit()
+
+    def rollback(self):
+        self.c.rollback()
+
+    def close(self):
+        self.c.close()
+
+
+def pg_schema(schema):
+    return schema.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY").replace("BLOB", "BYTEA")
+
+
+def raw_connect():
+    if DATABASE_URL:
+        return PGConn()
+    con = sqlite3.connect(DB_PATH, timeout=15)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys=ON")
+    return con
+
+
+def apply_schema(con):
+    if DATABASE_URL:
+        for stmt in pg_schema(SCHEMA).split(";"):
+            if stmt.strip():
+                con.execute(stmt)
+    else:
+        con.execute("PRAGMA journal_mode=WAL")
+        con.executescript(SCHEMA)
+
+
 
 def now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -120,9 +204,7 @@ def now():
 
 def db():
     if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH, timeout=15)
-        g.db.row_factory = sqlite3.Row
-        g.db.execute("PRAGMA foreign_keys=ON")
+        g.db = raw_connect()
     return g.db
 
 
@@ -152,9 +234,10 @@ DUMMY_HASH = hash_pw("dummy-password")
 
 
 def init_db():
-    con = sqlite3.connect(DB_PATH)
-    con.execute("PRAGMA journal_mode=WAL")
-    con.executescript(SCHEMA)
+    con = raw_connect()
+    if DATABASE_URL:
+        con.execute("SELECT pg_advisory_lock(424242)")  # evita corrida entre os workers do gunicorn
+    apply_schema(con)
     row = con.execute("SELECT id FROM users WHERE email=?", (ADMIN_EMAIL,)).fetchone()
     if not row:
         pw = os.environ.get("ADMIN_PASSWORD")
@@ -297,7 +380,7 @@ def api_register():
             (email, hash_pw(pw), now()),
         )
         db().commit()
-    except sqlite3.IntegrityError:
+    except INTEGRITY:
         return jsonify(error="Este e-mail já está cadastrado. Use 'Entrar'."), 409
     session.clear()
     session["uid"] = cur.lastrowid
@@ -674,7 +757,7 @@ def api_version_create(slug):
             "INSERT INTO versions(app_id, tag, notes, created_at) VALUES (?,?,?,?)",
             (a["id"], tag, notes, now()),
         )
-    except sqlite3.IntegrityError:
+    except INTEGRITY:
         return jsonify(error=f"A versão '{tag}' já existe neste app."), 409
     vid = cur.lastrowid
     db().executemany(
@@ -788,8 +871,7 @@ EXEMPLOS = [
 
 
 def seed():
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
+    con = raw_connect()
     n = 0
     for name, desc, cat in EXEMPLOS:
         slug = slugify(name)
@@ -811,8 +893,8 @@ def seed():
 init_db()
 
 if os.environ.get("SEED_ON_START") == "1":
-    _c = sqlite3.connect(DB_PATH)
-    _n = _c.execute("SELECT COUNT(*) FROM apps").fetchone()[0]
+    _c = raw_connect()
+    _n = _c.execute("SELECT COUNT(*) AS n FROM apps").fetchone()["n"]
     _c.close()
     if _n == 0:
         seed()

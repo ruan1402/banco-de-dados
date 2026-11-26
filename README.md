@@ -25,18 +25,19 @@ Na primeira execução o sistema gera a senha do admin, mostra no terminal e sal
 Entre com `domruan1402@gmail.com`, clique em **Alterar senha** e apague esse arquivo.
 Para escolher a senha antes: `ADMIN_PASSWORD=suaSenhaForte python app.py`.
 
-## Publicar online (link único) — passo a passo no Render
-1. Crie uma conta em https://github.com e um repositório **privado** novo (ex.: `catalogo-de-apps`). Envie todos os arquivos desta pasta para ele (botão *Add file → Upload files*).
-2. Crie uma conta em https://render.com e clique em **New → Blueprint**. Conecte o GitHub e escolha o repositório: o Render lê o `render.yaml` sozinho.
-3. Quando ele pedir `ADMIN_PASSWORD`, digite a senha que você quer para `domruan1402@gmail.com`.
-4. Clique em **Apply**. Em alguns minutos aparece o link, algo como `https://catalogo-de-apps.onrender.com`. Esse é o link único para você e para os outros.
-5. Abra o link, entre com seu e-mail e a senha. Os 13 apps de exemplo já vêm cadastrados (`SEED_ON_START=1`; depois pode apagar essa variável).
+## Publicar online de graça (servidor grátis + banco no Neon)
+O banco fica no **Neon** (Postgres grátis, permanente). O servidor pode ser qualquer um gratuito (Render grátis, etc.): ele pode dormir e reiniciar sem perder dados.
 
-Observações:
-- O plano **starter** (pago, cerca de US$ 7/mês) é necessário para ter o **disco persistente** onde fica o banco. Sem disco, os dados se perdem a cada reinício.
-- Alternativas: Railway, Fly.io ou um VPS. Há um `Dockerfile` pronto (`docker build -t catalogo .` e `docker run -p 8000:8000 -v dados:/data -e ADMIN_PASSWORD=suaSenha catalogo`).
-- HTTPS já vem ligado no Render; mantenha `COOKIE_SECURE=1`.
-- Faça backup do arquivo `catalogo.db` (apps, usuários e todo o código ficam nele).
+1. No Neon, copie a URL de conexão (`postgresql://...`). Ela contém a senha: nunca coloque no GitHub.
+2. No servidor, defina as variáveis de ambiente:
+   - `DATABASE_URL` = a URL do Neon
+   - `ADMIN_PASSWORD` = a senha que você quer para `domruan1402@gmail.com`
+   - `REQUIRE_DATABASE_URL=1`, `COOKIE_SECURE=1`, `BEHIND_PROXY=1`
+   - `SEED_ON_START=1` (só na primeira vez; cadastra os 13 apps de exemplo)
+3. Comando de início: `gunicorn -w 2 -b 0.0.0.0:$PORT app:app`
+4. Sem `DATABASE_URL` o sistema usa SQLite local (bom para testar no seu computador, mas os dados somem em hospedagens sem disco).
+
+Há também `Dockerfile` e `Procfile` prontos.
 
 ## API (para outras ferramentas)
 Todas as chamadas exigem login por cookie e o cabeçalho `X-Requested-With: catalogo`. Escrita só para o admin.
