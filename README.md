@@ -55,3 +55,17 @@ app.py          servidor + banco + regras de acesso
 static/         telas (index.html, app.js, style.css)
 data/           criado ao rodar: catalogo.db, secret.key
 ```
+
+## API para o Claude cadastrar apps (`/api/publish`)
+
+Defina a variável `API_TOKEN` no servidor. Depois:
+
+```
+POST /api/publish          Authorization: Bearer <API_TOKEN>
+{ "name": "...", "description": "...", "category": "...", "tech": ["HTML","JS"],
+  "url": "", "readme": "# ...", "version": "1.0", "notes": "...",
+  "files": [ {"path": "index.html", "content": "..."}, {"path": "img.png", "content_b64": "..."} ] }
+GET  /api/publish/apps     lista os apps (para checar duplicados)
+```
+
+O status é sempre `pronto`. Se o nome já existir, o app é atualizado e a versão é substituída (mesmo `version`) ou criada.

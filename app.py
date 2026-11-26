@@ -8,6 +8,7 @@ Catálogo de Aplicações — cadastro dos seus apps, com código guardado no ba
 - Rodar:  pip install -r requirements.txt  &&  python app.py
 """
 import io
+import base64
 import os
 import re
 import sys
@@ -274,6 +275,8 @@ def init_db():
 # --------------------------------------------------------------------------- segurança
 @app.before_request
 def csrf_guard():
+    if request.path.startswith("/api/publish"):
+        return None  # autenticado por token Bearer, sem cookies
     if request.method in ("POST", "PUT", "PATCH", "DELETE"):
         if request.headers.get("X-Requested-With") != "catalogo":
             return jsonify(error="Requisição inválida."), 403
@@ -762,6 +765,112 @@ def api_version_create(slug):
     db().execute("UPDATE apps SET updated_at=? WHERE id=?", (now(), a["id"]))
     db().commit()
     return jsonify(id=vid, files=len(items)), 201
+
+
+# --------------------------------------------------------------------------- API para o Claude publicar apps
+API_TOKEN = os.environ.get("API_TOKEN", "")
+
+
+def token_required(f):
+    @wraps(f)
+    def w(*a, **k):
+        if not API_TOKEN:
+            return jsonify(error="API desativada (defina API_TOKEN)."), 404
+        key = ("tok", request.remote_addr)
+        if throttled(key):
+            return jsonify(error="Muitas tentativas. Aguarde alguns minutos."), 429
+        got = request.headers.get("Authorization", "")
+        got = got[7:] if got.lower().startswith("bearer ") else ""
+        if not got or not hmac.compare_digest(got.encode(), API_TOKEN.encode()):
+            FAILS.setdefault(key, []).append(time.time())
+            return jsonify(error="Token inválido."), 401
+        return f(*a, **k)
+    return w
+
+
+@app.get("/api/publish/apps")
+@token_required
+def api_publish_list():
+    rows = db().execute("SELECT slug, name, status, updated_at FROM apps ORDER BY name").fetchall()
+    return jsonify(apps=[dict(r) for r in rows])
+
+
+@app.post("/api/publish")
+@token_required
+def api_publish():
+    """Cadastra (ou atualiza, pelo nome) um app como PRONTO, com README e código em uma versão.
+
+    JSON: name*, description, category, tech ("A, B" ou lista), url, readme,
+          version (padrão "1.0"), notes, files: [{path, content | content_b64}]
+    """
+    d = read_json()
+    tech = d.get("tech", "")
+    if isinstance(tech, list):
+        tech = ", ".join(str(x) for x in tech)
+    d = {**d, "tech": tech, "status": "pronto"}  # tudo que o Claude cadastra já está pronto
+    f, err = clean_app_fields(d)
+    if err:
+        return jsonify(error=err), 400
+    tag = str(d.get("version") or "1.0").strip()
+    if not re.match(r"^[\w.\- ]{1,30}$", tag):
+        return jsonify(error="Nome da versão inválido."), 400
+    notes = str(d.get("notes", "")).strip()[:2000]
+
+    raw = {}
+    for it in d.get("files") or []:
+        if not isinstance(it, dict):
+            continue
+        p = clean_path(str(it.get("path", "")))
+        if not p:
+            continue
+        try:
+            if "content_b64" in it:
+                data = base64.b64decode(str(it["content_b64"]), validate=True)
+            else:
+                data = str(it.get("content", "")).encode("utf-8")
+        except Exception:
+            return jsonify(error=f"Conteúdo inválido em {p}."), 400
+        if len(data) > MAX_FILE:
+            return jsonify(error=f"O arquivo {p} passa de 5 MB."), 400
+        raw[p] = data
+    if len(raw) > MAX_FILES or sum(len(x) for x in raw.values()) > MAX_TOTAL:
+        return jsonify(error="Arquivos demais ou grandes demais."), 400
+
+    t = now()
+    base = slugify(f["name"])
+    a = db().execute("SELECT * FROM apps WHERE slug=? OR LOWER(name)=LOWER(?)", (base, f["name"])).fetchone()
+    created = a is None
+    if created:
+        slug = unique_slug(base)
+        db().execute(
+            """INSERT INTO apps(slug,name,description,category,status,tech,url,readme,created_at,updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (slug, f["name"], f["description"], f["category"], "pronto", f["tech"], f["url"], f["readme"], t, t),
+        )
+        a = get_app(slug)
+    else:
+        db().execute(
+            """UPDATE apps SET name=?,description=?,category=?,status='pronto',tech=?,url=?,readme=?,updated_at=?
+               WHERE id=?""",
+            (f["name"], f["description"] or a["description"], f["category"] or a["category"],
+             f["tech"] or a["tech"], f["url"] or a["url"], f["readme"] or a["readme"], t, a["id"]),
+        )
+    n_files = 0
+    if raw:
+        old = db().execute("SELECT id FROM versions WHERE app_id=? AND tag=?", (a["id"], tag)).fetchone()
+        if old:
+            db().execute("DELETE FROM files WHERE version_id=?", (old["id"],))
+            db().execute("DELETE FROM versions WHERE id=?", (old["id"],))
+        cur = db().execute(
+            "INSERT INTO versions(app_id, tag, notes, created_at) VALUES (?,?,?,?)", (a["id"], tag, notes, t))
+        db().executemany(
+            "INSERT INTO files(version_id, path, size, is_text, content) VALUES (?,?,?,?,?)",
+            [(cur.lastrowid, p, len(x), 1 if looks_text(x) else 0, x) for p, x in sorted(raw.items())],
+        )
+        n_files = len(raw)
+    db().commit()
+    return jsonify(slug=a["slug"], created=created, status="pronto", version=tag if raw else None,
+                   files=n_files), 201 if created else 200
 
 
 def get_version(vid):
