@@ -4,6 +4,5 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 ENV DATA_DIR=/data COOKIE_SECURE=1 BEHIND_PROXY=1 PORT=8000
-VOLUME /data
 EXPOSE 8000
 CMD ["sh", "-c", "gunicorn -w 2 -b 0.0.0.0:${PORT} app:app"]
