@@ -1,1 +1,1 @@
-{"name":"Segundo Teste","description":"outro","tech":"Python, Flask"}
+{"name": "Segundo Teste", "description": "outro", "tech": "Python, Flask", "remover": true}
