@@ -239,6 +239,10 @@ def init_db():
         con.execute("SELECT pg_advisory_lock(424242)")  # evita corrida entre os workers do gunicorn
     apply_schema(con)
     row = con.execute("SELECT id FROM users WHERE email=?", (ADMIN_EMAIL,)).fetchone()
+    if row and os.environ.get("ADMIN_PASSWORD_RESET") == "1" and os.environ.get("ADMIN_PASSWORD"):
+        # redefine a senha do admin a partir da variável (use uma vez e volte RESET para 0)
+        con.execute("UPDATE users SET pw_hash=? WHERE id=?", (hash_pw(os.environ["ADMIN_PASSWORD"]), row["id"]))
+        con.commit()
     if not row:
         pw = os.environ.get("ADMIN_PASSWORD")
         generated = False
