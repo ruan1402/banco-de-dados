@@ -8,6 +8,10 @@ Catálogo de Aplicações — cadastro dos seus apps, com código guardado no ba
 - Rodar:  pip install -r requirements.txt  &&  python app.py
 """
 import io
+import urllib.request
+import threading
+import json
+import tarfile
 import base64
 import os
 import re
@@ -101,6 +105,10 @@ CREATE TABLE IF NOT EXISTS versions (
   created_at TEXT NOT NULL,
   UNIQUE(app_id, tag)
 );
+CREATE TABLE IF NOT EXISTS sync_state (
+  slug TEXT PRIMARY KEY,
+  digest TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS files (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
@@ -155,7 +163,8 @@ class PGConn:
 
     def execute(self, sql, params=()):
         q = pg_sql(sql)
-        is_insert = q.lstrip().upper().startswith("INSERT") and "RETURNING" not in q.upper()
+        is_insert = (q.lstrip().upper().startswith("INSERT") and "RETURNING" not in q.upper()
+                     and "SYNC_STATE" not in q.upper())
         if is_insert:
             q += " RETURNING id"
         cur = self.c.execute(q, params)
@@ -873,6 +882,202 @@ def api_publish():
                    files=n_files), 201 if created else 200
 
 
+# --------------------------------------------------------------------------- sincronização via GitHub
+# O Claude envia cada projeto para a branch "projetos" do repositório:
+#   projetos/<slug>/projeto.json   (name, description, category, tech, url, version, notes)
+#   projetos/<slug>/README.md
+#   projetos/<slug>/codigo/...     (arquivos do projeto)
+# O servidor lê essa branch e cadastra/atualiza os apps (sempre como "pronto").
+SYNC_REPO = os.environ.get("SYNC_REPO", "")
+SYNC_BRANCH = os.environ.get("SYNC_BRANCH", "projetos")
+SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL", "120"))
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+SYNC_STATUS = {"last": None, "result": None}
+
+
+def fetch_branch_tar():
+    if GITHUB_TOKEN:
+        url = f"https://api.github.com/repos/{SYNC_REPO}/tarball/{SYNC_BRANCH}"
+    else:
+        url = f"https://codeload.github.com/{SYNC_REPO}/tar.gz/refs/heads/{SYNC_BRANCH}"
+    req = urllib.request.Request(url, headers={"User-Agent": "catalogo-sync"})
+    if GITHUB_TOKEN:
+        req.add_header("Authorization", f"Bearer {GITHUB_TOKEN}")
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = r.read(MAX_TOTAL + 1)
+    if len(data) > MAX_TOTAL:
+        raise ValueError("Repositório grande demais para sincronizar.")
+    return data
+
+
+def read_projects(tar_bytes):
+    """Lê o tar.gz da branch e devolve {slug: {"meta":..., "readme":..., "files": {path: bytes}}}."""
+    projects = {}
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tf:
+        for m in tf:
+            if not m.isfile() or m.size > MAX_FILE:
+                continue
+            parts = m.name.split("/")[1:]  # remove a pasta raiz do tar
+            if len(parts) < 3 or parts[0] != "projetos":
+                continue
+            if any(x in ("", ".", "..") for x in parts):
+                continue
+            slug = slugify(parts[1])
+            rest = "/".join(parts[2:])
+            p = projects.setdefault(slug, {"meta": {}, "readme": "", "files": {}})
+            data = tf.extractfile(m).read()
+            if rest == "projeto.json":
+                try:
+                    meta = json.loads(data.decode("utf-8"))
+                    p["meta"] = meta if isinstance(meta, dict) else {}
+                except Exception:
+                    p["meta"] = {}
+            elif rest.lower() == "readme.md":
+                p["readme"] = data.decode("utf-8", "replace")
+            elif parts[2] == "codigo" and len(parts) > 3:
+                cp = clean_path("/".join(parts[3:]))
+                if cp:
+                    p["files"][cp] = data
+    return projects
+
+
+def apply_projects(projects):
+    """Cadastra/atualiza os apps. Idempotente: só mexe no que mudou. Devolve um resumo."""
+    con = raw_connect()
+    out = {"novos": [], "atualizados": [], "removidos": [], "iguais": 0, "erros": []}
+    try:
+        for slug, p in sorted(projects.items()):
+            try:
+                meta = p["meta"]
+                digest = hashlib.sha256(json.dumps(meta, sort_keys=True).encode() + p["readme"].encode()
+                                        + b"".join(k.encode() + hashlib.sha256(v).digest()
+                                                   for k, v in sorted(p["files"].items()))).hexdigest()
+                st = con.execute("SELECT digest FROM sync_state WHERE slug=?", (slug,)).fetchone()
+                if st and st["digest"] == digest:
+                    out["iguais"] += 1
+                    continue
+                row = con.execute("SELECT * FROM apps WHERE slug=?", (slug,)).fetchone()
+                if meta.get("remover") is True:
+                    if row:
+                        con.execute("DELETE FROM apps WHERE id=?", (row["id"],))
+                        out["removidos"].append(slug)
+                    con.execute("DELETE FROM sync_state WHERE slug=?", (slug,))
+                    con.execute("INSERT INTO sync_state(slug, digest) VALUES (?,?)", (slug, digest))
+                    con.commit()
+                    continue
+                tech = meta.get("tech", "")
+                if isinstance(tech, list):
+                    tech = ", ".join(str(x) for x in tech)
+                fields, err = clean_app_fields({
+                    "name": meta.get("name") or slug.replace("-", " ").title(),
+                    "description": meta.get("description", ""), "category": meta.get("category", ""),
+                    "tech": tech, "url": meta.get("url", ""), "readme": p["readme"], "status": "pronto"})
+                if err:
+                    out["erros"].append(f"{slug}: {err}")
+                    continue
+                t = now()
+                if row:
+                    con.execute(
+                        """UPDATE apps SET name=?,description=?,category=?,status='pronto',tech=?,url=?,readme=?,updated_at=?
+                           WHERE id=?""",
+                        (fields["name"], fields["description"], fields["category"], fields["tech"],
+                         fields["url"], fields["readme"], t, row["id"]))
+                    app_id = row["id"]
+                    out["atualizados"].append(slug)
+                else:
+                    con.execute(
+                        """INSERT INTO apps(slug,name,description,category,status,tech,url,readme,created_at,updated_at)
+                           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                        (slug, fields["name"], fields["description"], fields["category"], "pronto",
+                         fields["tech"], fields["url"], fields["readme"], t, t))
+                    app_id = con.execute("SELECT id FROM apps WHERE slug=?", (slug,)).fetchone()["id"]
+                    out["novos"].append(slug)
+                if p["files"]:
+                    tag = str(meta.get("version") or "1.0").strip()
+                    if not re.match(r"^[\w.\- ]{1,30}$", tag):
+                        tag = "1.0"
+                    old = con.execute("SELECT id FROM versions WHERE app_id=? AND tag=?", (app_id, tag)).fetchone()
+                    if old:
+                        con.execute("DELETE FROM files WHERE version_id=?", (old["id"],))
+                        con.execute("DELETE FROM versions WHERE id=?", (old["id"],))
+                    cur = con.execute(
+                        "INSERT INTO versions(app_id, tag, notes, created_at) VALUES (?,?,?,?)",
+                        (app_id, tag, str(meta.get("notes", ""))[:2000], t))
+                    vid = cur.lastrowid
+                    con.executemany(
+                        "INSERT INTO files(version_id, path, size, is_text, content) VALUES (?,?,?,?,?)",
+                        [(vid, fp, len(x), 1 if looks_text(x) else 0, x) for fp, x in sorted(p["files"].items())])
+                con.execute("DELETE FROM sync_state WHERE slug=?", (slug,))
+                con.execute("INSERT INTO sync_state(slug, digest) VALUES (?,?)", (slug, digest))
+                con.commit()
+            except Exception as e:  # um projeto com problema não trava os outros
+                con.rollback()
+                out["erros"].append(f"{slug}: {e}")
+    finally:
+        con.close()
+    return out
+
+
+def run_sync():
+    if not SYNC_REPO:
+        return {"erro": "SYNC_REPO não definido"}
+    try:
+        res = apply_projects(read_projects(fetch_branch_tar()))
+    except Exception as e:
+        res = {"erro": str(e)}
+    SYNC_STATUS["last"] = now()
+    SYNC_STATUS["result"] = res
+    if res.get("novos") or res.get("atualizados") or res.get("removidos") or res.get("erros") or res.get("erro"):
+        print("[sync]", json.dumps(res, ensure_ascii=False), flush=True)
+    return res
+
+
+def _sync_once_locked():
+    """Evita que os workers do gunicorn sincronizem ao mesmo tempo."""
+    if DATABASE_URL:
+        c = raw_connect()
+        try:
+            got = c.execute("SELECT pg_try_advisory_lock(424243) AS ok").fetchone()["ok"]
+            if not got:
+                return None
+            try:
+                return run_sync()
+            finally:
+                c.execute("SELECT pg_advisory_unlock(424243)")
+        finally:
+            c.close()
+    import fcntl
+    with open(DATA / ".sync.lock", "w") as lf:
+        try:
+            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return None
+        return run_sync()
+
+
+def _sync_loop():
+    time.sleep(5)
+    while True:
+        try:
+            _sync_once_locked()
+        except Exception as e:
+            print("[sync] falhou:", e, flush=True)
+        time.sleep(SYNC_INTERVAL)
+
+
+@app.post("/api/sync")
+@admin_required
+def api_sync():
+    res = _sync_once_locked()
+    return jsonify(result=res if res is not None else SYNC_STATUS["result"])
+
+
+@app.get("/api/sync")
+@admin_required
+def api_sync_status():
+    return jsonify(enabled=bool(SYNC_REPO), repo=SYNC_REPO, branch=SYNC_BRANCH, **SYNC_STATUS)
+
+
 def get_version(vid):
     return db().execute(
         "SELECT v.*, a.slug AS app_slug FROM versions v JOIN apps a ON a.id=v.app_id WHERE v.id=?", (vid,)
@@ -1012,6 +1217,10 @@ else:
     with open(DATA / ".init.lock", "w") as _lf:
         fcntl.flock(_lf, fcntl.LOCK_EX)
         _startup()
+
+
+if SYNC_REPO and os.environ.get("SYNC_THREAD", "1") == "1":
+    threading.Thread(target=_sync_loop, daemon=True).start()
 
 
 @app.get("/healthz")

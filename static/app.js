@@ -82,7 +82,7 @@ function shell(inner) {
         </nav>
         <div class="account">
           <div class="who"><span>${esc(ME.email)}</span><small>${ME.admin ? "Administrador" : "Somente visualização"}</small></div>
-          ${ME.admin ? `<button class="btn ghost" id="btn-pw">Senha</button>` : ""}
+          ${ME.admin ? `<button class="btn ghost" id="btn-sync" title="Buscar projetos novos enviados pelo Claude">Sincronizar</button><button class="btn ghost" id="btn-pw">Senha</button>` : ""}
           <button class="btn ghost" id="btn-logout">Sair</button>
         </div>
       </header>
@@ -90,6 +90,16 @@ function shell(inner) {
     </div>`;
   $("#btn-logout").onclick = async () => { try { await api("POST", "/api/logout"); } catch { /* ignora */ } ME = null; go("#/login"); };
   if ($("#btn-pw")) $("#btn-pw").onclick = changePasswordDialog;
+  if ($("#btn-sync")) $("#btn-sync").onclick = async () => {
+    const b = $("#btn-sync"); b.disabled = true; b.textContent = "Sincronizando…";
+    try {
+      const { result: r } = await api("POST", "/api/sync");
+      const n = r ? (r.novos || []).length + (r.atualizados || []).length : 0;
+      if (r && r.erro) toast("Erro: " + r.erro);
+      else { toast(n ? `${n} projeto(s) sincronizado(s).` : "Tudo já estava atualizado."); if (n) { navId++; route(); } }
+    } catch (e) { toast(e.message); }
+    b.disabled = false; b.textContent = "Sincronizar";
+  };
 }
 
 const head = (eyebrow, title, right = "") =>
